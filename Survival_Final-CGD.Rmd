@@ -1,0 +1,737 @@
+---
+title: "Final Project"
+author: "Noah Couch"
+output: 
+  html_document:
+    theme: cerulean
+    toc: true
+    toc_float: true
+    css: "margins.css"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, cache = TRUE)
+knitr::opts_chunk$set(fig.width=12, fig.height=8)
+```
+
+```{r, message = FALSE}
+# Load packages 
+library(ggplot2) ## for plots
+library(ggpubr) ## for combining ggplots
+library(gridExtra) ## for combining plots and tables
+library(KMsurv) ## for testing proportional hazards
+library(latex2exp) ## for mathy plot labels
+library(survival) ## for nonparametric estimates
+library(dplyr) ## for data wrangling
+library(tidyr) ## to "gather" data from wide to long
+library(survminer) ## for pretty survival plots
+library(ggmosaic) ## for mosaic plot
+library(kableExtra) ## for formatted tables
+```
+
+## **Introduction**
+
+We will read in the `cgd` data from the `survival` package. 
+
+```{r}
+# Reading in CGD data from the survival package
+cgd_data <- cgd
+```
+
+From here, we must calculate a few new variables. To begin, we are given the beginning and end times for the observation of each patient from the `tstart` and `tstop` variables. We'd like to create a new variable, `time`, which measures the time to infection or censoring in days. To calculate this we will subtract the start time from the end time. I also wish to recode the `treat` variable using binary data for 0 representing the placebo group, and 1 representing those given gamma interferon. I will also do this for other categorical variables. Then, since we are in the United States and these are the units I found for the BMI calculations, we will convert the measurements for height and weight from metric to standard. For weight, we will calculate `weight_lbs`by the formula, $\texttt{weight} \times 2.2$. Then for height, we will calculate `height_in` by, $\texttt{height} \times 0.3937$. With these, we will then calculate each patients BMI using the following formula from the CDC, $$703 \times \frac{\texttt{weight_lbs}}{(\texttt{height_in})^2}.$$ While this measure is flawed amongst athletic individuals with high muscle content, for the average individual it is an acceptable measure of body composition which would be interesting to look at. In addition, we will discretize the continuous variables, `BMI` and `age`, by partitioning the data into groups. The width of the age ranges will be ten years with a thirty and over group because there was only one individual is over forty. BMI will be grouped by the categories given by the CDC. Finally, the patient with ID 109 will be excluded due to perceived inaccuracy of their reported measurements. In addition, when fitting models using BMI, I will exclude patients younger than two years-old because the CDC says BMI is not an accurate measure of body composition for those younger than this. 
+
+```{r, message=FALSE}
+# Calculating new variables ----------------------------------------------------
+
+cgd_data <- cgd_data %>%
+  mutate(time = tstop - tstart) |>   ### Calculating time to infection or censoring
+  mutate(treatment = as.numeric(treat == "rIFN-g")) |>   ### Recoding treat
+  mutate(inheritance = as.numeric(inherit == "autosomal")) |> ### Recoding inherit
+  mutate(weight_lbs = weight * 2.2) |>   ### Converting kg -> lbs
+  mutate(height_in = height * 0.3937) |>   ### Converting cm -> in
+  mutate(bmi = 703 * (weight_lbs / height_in^2)) |>   ### Calculating BMI 
+  # The following are the categories of BMI given by the CDC
+  mutate(bmi_cat = case_when(bmi < 18.5 ~ "underweight",
+                             bmi >= 18.5 & bmi < 25 ~ "normal",
+                             bmi >= 25 & bmi <30 ~ "overweight",
+                             bmi >= 30 & bmi <= 45 ~ "obese",
+                             bmi > 45 ~ "Thrown out")) |>   ### BMIs in this range  
+                                                            ### suggest error in 
+                                                            ### measurements
+  # The following are our 10-year age ranges
+  mutate(age_cat = case_when(age <= 10 ~ "0-10",
+                             age > 10 & age <= 20 ~ "10-20",
+                             age > 20 & age <= 30 ~ "20-30",
+                             age > 30 ~ "30-40"))      ### Only one observation
+
+# Filtering the data -----------------------------------------------------------
+
+# Excluding duplicate measures (measurements taken after first infection)
+cgd_data <- cgd_data |>
+  filter(enum == 1)
+
+# Excluding ID 109
+cgd_data <- cgd_data |>
+  filter(!id == 109)
+
+# Excluding One over 30 year old
+cgd_data <- cgd_data |>
+  filter(!age > 50)
+
+# Excluding children younger than 2 for BMI
+cgd_data_BMI <- cgd_data |>
+  filter(age >= 2)
+```
+
+Now that we have cleaned the data, we will provide a quick description of the variables we plan to use.
+
+  -   `time`: time to serious infection (event) or study end (censored), 
+  -   `status`: an indicator that the patient developed an infection before study end, 
+  -   `treat`: a two-level categorical classifier of the group the patient was assigned to. It was "rIFN-g" for the treatment group given gamma interferon, and "placebo" for the placebo group.
+  -   `sex`: an indicator of whether the patient was assigned "male" or "female" at birth.
+  -   `age`: a continuous variable indicating the age in years of patients at the start of study.
+  -   `inherit`: an indicator of the pattern of inheritance. Patients could have the gene for CGD located on the sex chromosome, indicated by "X-linked", or their non-sex chromosome, indicated by "autosomal".
+  -   `bmi`: a continuous variable for the calculated BMI of patient. These values were between 12 and 30.
+  -   `bmi_cat`: a categorical variable that divides bmi into three categories, "underweight", "normal", and "overweight".
+
+## **Exploratory Data Analysis** {.tabset}
+
+We will look various continuous and discrete covariates. Before we continue in our analysis, we will look at how each variable we wish to observe is distributed in our data. To do this, we will observe the counts in a table as well as bar plots. The main one we wish to focus on is the `treat` variable, which denotes whether the patient was in the placebo group (`treat` = 0), or given gamma interferon (`treat` = 1). We will also look for interactions between treatment and age, sex, and disease inheritance. 
+
+### 1: Treatment Group
+```{r}
+# Bar Plot for the number of patients in each treatment group
+treat.plot <- data.frame(treat = c("Gamma Interferon",
+                                   "Placebo"),
+                         count = c(length(cgd_data$treat[cgd_data$treatment == 1]),
+                                   length(cgd_data$treat[cgd_data$treatment == 0]))) |>
+  ggplot(aes(x = treat, y = count, fill = treat)) +
+  geom_bar(stat = "identity") +
+  xlab("Treatment") +
+  ylab("Count") +
+  ggtitle("Number of Patients given Gamma Interferon") +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.background = element_blank(),
+        axis.text.y = element_text(angle = 90, vjust = 0.5, hjust=0.5),
+        axis.title.y = element_blank(),
+        legend.position="none") +
+  scale_fill_manual(values = c("#FEE090", "#F46D43")) +
+  coord_flip()
+
+treat.plot
+```
+Notice we have almost equivalent patients in each of the groups. Now we observe mosaic plots between variables and the status of each patient (whether they experienced an infection).
+
+### 2: Treatment Group x Event
+```{r}
+# Mosaic for Treatment Group and Event -----------------------------------------
+treat.stat <- cgd_data |>
+  mutate(treatment = forcats::fct_recode(as.factor(treatment),
+                                         "Placebo" = '0',
+                                         "Gamma Interferon" = '1')) |>
+  mutate(status = forcats::fct_recode(as.factor(status),
+                                         "No Infection" = '0',
+                                         "Infection" = '1')) |>
+  ggplot() +
+  geom_mosaic(aes(x = product(status), fill = treatment), show.legend = FALSE) +
+  xlab("Event") +
+  ylab("Treatment Group") + 
+  ggtitle("Outcome by Treatment Group") +
+  theme_mosaic() + 
+  scale_fill_manual(values = c("#F46D43", "#FEE090"))
+
+treat.stat
+```
+
+### 3: Sex x Event
+```{r}
+# Mosaic for Sex and Event -----------------------------------------------------
+sex.stat <- cgd_data |>
+  mutate(status = forcats::fct_recode(as.factor(status),
+                                      "No Infection" = '0',
+                                      "Infection" = '1')) |>
+  mutate(sex = forcats::fct_recode(as.factor(sex),
+                                      "Male" = 'male',
+                                      "Female" = 'female')) |>
+  ggplot() +
+  geom_mosaic(aes(x = product(status), fill = sex), show.legend = FALSE) +
+  xlab("Event") +
+  ylab("Sex") + 
+  ggtitle("Outcome by Sex") +
+  theme_mosaic() + 
+  scale_fill_manual(values = c("#F46D43", "#FEE090"))
+
+sex.stat
+```
+
+### 4: Pattern of Inheritance x Event
+```{r}
+# Mosaic for Pattern of Inheritance and Event ----------------------------------
+inherit.stat <- cgd_data |>
+  mutate(status = forcats::fct_recode(as.factor(status),
+                                      "No Infection" = '0',
+                                      "Infection" = '1')) |>
+  mutate(inherit = forcats::fct_recode(as.factor(inherit),
+                                      "Autosomal" = 'autosomal',
+                                      "X-linked" = 'X-linked')) |>
+  ggplot() +
+  geom_mosaic(aes(x = product(status), fill = inherit), show.legend = FALSE) +
+  xlab("Event") +
+  ylab("Inheritance") + 
+  ggtitle("Outcome by Inheritance") +
+  theme_mosaic() + 
+  scale_fill_manual(values = c("#FEE090", "#F46D43"))
+
+inherit.stat
+```
+
+### 5: Pattern of Inheritance x Sex
+```{r}
+# Mosaic for Pattern of Inheritance and Sex ------------------------------------
+inherit.sex <- cgd_data |>
+  mutate(inherit = forcats::fct_recode(as.factor(inherit),
+                                       "Autosomal" = 'autosomal',
+                                       "X-linked" = 'X-linked')) |>
+  mutate(sex = forcats::fct_recode(as.factor(sex),
+                                   "Male" = 'male',
+                                   "Female" = 'female')) |>
+  ggplot() +
+  geom_mosaic(aes(x = product(sex), fill = inherit), show.legend = FALSE) +
+  xlab("Event") +
+  ylab("Sex") + 
+  ggtitle("Inheritance by Sex") +
+  theme_mosaic() + 
+  scale_fill_manual(values = c("#F46D43", "#FEE090"))
+
+inherit.sex
+```
+
+### 6: BMI x Event
+```{r}
+# Mosaic for BMI and Event -----------------------------------------------------
+bmi.stat <- cgd_data |>
+  mutate(status = forcats::fct_recode(as.factor(status),
+                                      "No Infection" = '0',
+                                      "Infection" = '1')) |>
+  ggplot() +
+  geom_mosaic(aes(x = product(status), fill = bmi_cat), show.legend = FALSE) +
+  xlab("Event") +
+  ylab("BMI") + 
+  ggtitle("Outcome by BMI Group") +
+  theme_mosaic() + 
+  scale_fill_manual(values = c("#FEE090", "#F46D43", "darkgrey"))
+
+bmi.stat
+```
+
+## **Data Analysis**
+
+This section is where we will perform our main analysis. This includes fitting Cox proportional hazard models, and using Breslow's estimator or the Kaplan Meier estimator to find survival probabilities for each scenario. We will report all estimates of survival or hazard ratios with a 95% confidence interval.
+
+### **Overall Survival**
+
+We begin by fitting the overall survival curve. I am doing this using the Kaplan Meier estimator because it should be equivalent to the curve found from Breslow's estimator with a Cox proportional hazards model with no covariates. We will do this with the `survfit` function, and use `ggsurvplot` to plot the survival curve. 
+
+```{r}
+# Overall Survival -------------------------------------------------------------
+
+# Using survfit function to find Survival Estimates 
+surv.ovrll <- survfit(Surv(time = time, event = status) ~ 1,
+                      data = cgd_data,
+                      conf.type = "log-log")
+
+# Data frame of survival estimates 
+summary.ovrll <- data.frame(Time = summary(surv.ovrll)$time,
+                            Surv = summary(surv.ovrll)$surv,
+                            lb = summary(surv.ovrll)$lower,
+                            ub = summary(surv.ovrll)$upper) |>
+  round(3)
+
+# Selecting our desired times for survival estimates
+summary.ovrll <- summary.ovrll |>
+  filter(Time %in% c(23,99,187,294))
+
+
+# Formatted Table
+summary.ovrll |>
+  kable(align = "cccc", col.names = c("$\\text{Time}$",
+                                      "$\\hat{S}(x)$",
+                                      "$\\text{Lower Bound}$",
+                                      "$\\text{Upper Bound}$")) |>
+  kable_styling() |>
+  add_header_above(c(" " = 2,
+                     "95% Confidence Interval for $\\hat{S}(x)$" = 2)) |>
+  add_header_above(c("Estimates of Survival, $\\hat{S}(x)$" = 4),
+                   color = "#007BA7")
+```
+
+```{r}
+# Plot the overall survival
+surv.ovrll |>
+  ggsurvplot(conf.int = FALSE)
+```
+
+## **Discrete Variables**
+
+Here we will analyze our discrete variables. This includes our main covariate of interest, `treat`. Recall this has two levels corresponding to the treatment group and placebo group. We will also test for an interaction between `treatment` and the other covariates.
+
+### **Treatment Alone**
+
+We begin by fitting the cox model to our CGD data using `treatment` as the only covariate.
+
+```{r}
+# Fitting Cox Model ------------------------------------------------------------
+Cox.treat = coxph(formula = Surv(time = time, event = status) ~ treat,
+                  data = cgd_data)
+```
+
+Now, we pull the estimates from the summary of the model. We report these in a formatted table.
+
+```{r}
+# Table of the estimated coefficient and other values
+Treat.coef.df <- data.frame(beta = summary(Cox.treat)$coefficients[1], # Log HR
+                            # 95% CI for log HR
+                            lb = summary(Cox.treat)$coefficients[1] - 
+                                  1.96 * summary(Cox.treat)$coefficients[3],
+                            ub = summary(Cox.treat)$coefficients[1] + 
+                                  1.96 * summary(Cox.treat)$coefficients[3],
+                            e.beta = summary(Cox.treat)$coefficients[2], # the HR
+                            # 95% CI for HR
+                            lb = summary(Cox.treat)$conf.int[3],
+                            ub = summary(Cox.treat)$conf.int[4],
+                            se = summary(Cox.treat)$coefficients[3], # Std Error from the model
+                            p.val = summary(Cox.treat)$coefficients[5]) |> round(3)
+
+# Formatted Table
+Treat.coef.df |>
+  kable(align = "cccc", col.names = c("$\\beta$",
+                                      "$\\text{Lower Bound}$",
+                                      "$\\text{Upper Bound}$",
+                                      "$\\exp{(\\beta)}$",
+                                      "$\\text{Lower Bound}$",
+                                      "$\\text{Upper Bound}$",
+                                      "$\\text{SE}(\\beta)$",
+                                      "$\\text{p-value}$")) |>
+  kable_styling() |>
+  add_header_above(c(" " = 1,
+                     "95% Confidence Interval for $\\beta$" = 2,
+                     " " = 1,
+                     "95% Confidence Interval for $\\exp(\\beta)$" = 2,
+                     " " = 2)) |>
+  add_header_above(c("Estimates of log HR, $\\beta$, from the Cox model" = 8),
+                   color = "#007BA7")
+```
+
+Now that we have the cox model, we can use Breslow's Estimator to estimate the baseline survival. This means, we can use the formula, $$S(x|\textbf{Z}) = S_0(x)^{\text{exp}(\beta^{\text{T}} \textbf{z})},$$ to estimate the survival probabilities. We will then plot the estimated survival curves and pull estimates for the survival probabilities at times 50, 100, 200, and 300 days. This will be reported with a 95% log-log confidence interval. This was not covered in class, but I found we can get variance of our survival estimates by passing a `coxph` object to the `survfit` function.
+
+```{r}
+# Calculating Survival Estimates -----------------------------------------------
+
+# Breslow's Estimator for Survival 
+Breslow.treat = basehaz(fit = Cox.treat, centered = FALSE) |> 
+  mutate(surv.placebo = exp(- hazard)) |> # Survival for the placebo group
+  # Survival for the treatment group using the formula stated previously
+  mutate(surv.treatment = surv.placebo ^ exp(Cox.treat$coefficients[1]) ) 
+
+# Plot Survival 
+Breslow.treat |> 
+  # Need all survival probabilities, for both groups, in one column
+  gather(key = "Treatment", value = "Survival", -c(1:2)) |>
+  mutate(Treatment = factor(x = Treatment,
+                        levels = c("surv.placebo", "surv.treatment"),
+                        labels = c("Placebo", "Treatment"))) |>
+  # Plotting survival curve
+  ggplot(aes(x = time, y = Survival, color = Treatment)) +
+  geom_step() +
+  theme_minimal()
+```
+
+```{r}
+# Survival Estimates for 50, 100, 200, 300 days --------------------------------
+
+# Creating a new data fram for the survfit function
+newdf <- data.frame(treat = c("placebo", "rIFN-g"))
+
+# Passing coxph object to survfit
+surv.treat <- survfit(Cox.treat,
+                      newdata = newdf,
+                      # We specify a log-log CI
+                      conf.type = "log-log")
+
+# Pulling the survival times and confidence intervals
+summary.bres.treat <- data.frame(Time = summary(surv.treat)$time,
+                                 Surv.plac = summary(surv.treat)$surv[,1],
+                                 lb.plac = summary(surv.treat)$lower[,1],
+                                 ub.plac = summary(surv.treat)$upper[,1],
+                                 Surv.trt = summary(surv.treat)$surv[,2],
+                                 lb.trt = summary(surv.treat)$lower[,2],
+                                 ub.trt = summary(surv.treat)$upper[,2]) |> round(3)
+
+# Filtering by the times we're interested in
+summary.bres.treat <- summary.bres.treat |>
+  filter(Time %in% c(23,99,187,294))
+
+# Removing the row times and adding the row name for 50,100,200,300 days
+summary.bres.treat <- summary.bres.treat[,-1]
+rownames(summary.bres.treat) <- c("50 days",
+                                  "100 days",
+                                  "200 days",
+                                  "300 days")
+
+# Formatted Table
+summary.bres.treat |>
+kable(align = "cccc", col.names = c("$\\hat{S}(x)$",
+                                    "Lower Bound",
+                                    "Upper Bound",
+                                    "$\\hat{S}(x)$",
+                                    "Lower Bound",
+                                    "Upper Bound")) |>
+  kable_styling() |>
+  add_header_above(c(" " = 2,
+                     "95% Confidence Interval for $\\hat{S}(x)$" = 2,
+                     " " = 1,
+                     "95% Confidence Interval for $\\hat{S}(x)$" = 2)) |>
+  add_header_above(c(" " = 1,
+                     "Placebo Group" = 3,
+                     "Gamma Interferon" = 3)) |>
+  add_header_above(c("Estimates of $\\hat{S}(x)$, from the Cox model with covariate $\\texttt{treatment}$" = 7),
+                   color = "#007BA7")
+
+```
+
+### **Interaction: Treatment and Sex**
+
+We will follow the same methods as the previous section up to plotting the survival curves. This will continue for interactions for sex, age, inheritance, and BMI
+
+```{r}
+# Fitting Cox Model ------------------------------------------------------------
+Cox.treat.sex = coxph(formula = Surv(time = time, event = status) ~ treat * sex,
+                      data = cgd_data)
+```
+
+```{r}
+# Table of the estimated coefficient and other values
+Treat.coef.df <- data.frame(beta = summary(Cox.treat.sex)$coefficients[,1],
+                            lb = summary(Cox.treat.sex)$coefficients[,1] - 
+                                  1.96 * summary(Cox.treat.sex)$coefficients[,3],
+                            ub = summary(Cox.treat.sex)$coefficients[,1] + 
+                                  1.96 * summary(Cox.treat.sex)$coefficients[,3],
+                            e.beta = summary(Cox.treat.sex)$coefficients[,2],
+                            lb = summary(Cox.treat.sex)$conf.int[,3],
+                            ub = summary(Cox.treat.sex)$conf.int[,4],
+                            se = summary(Cox.treat.sex)$coefficients[,3],
+                            p.val = summary(Cox.treat.sex)$coefficients[,5]) |> round(3)
+
+# Formatted Table 
+Treat.coef.df |>
+  kable(align = "cccc", col.names = c("$\\beta$",
+                                      "$\\text{Lower Bound}$",
+                                      "$\\text{Upper Bound}$",
+                                      "$\\exp{(\\beta)}$",
+                                      "$\\text{Lower Bound}$",
+                                      "$\\text{Upper Bound}$",
+                                      "$\\text{SE}(\\beta)$",
+                                      "$\\text{p-value}$")) |>
+  kable_styling() |>
+  add_header_above(c(" " = 2,
+                     "95% Confidence Interval for $\\beta$" = 2,
+                     " " = 1,
+                     "95% Confidence Interval for $\\exp(\\beta)$" = 2,
+                     " " = 2)) |>
+  add_header_above(c("Estimates of log HR, $\\beta$, from the Cox model" = 9),
+                   color = "#007BA7")
+```
+
+```{r}
+# Calculating Survival Estimates -----------------------------------------------
+
+# Breslow's Estimator for baseline survival
+Breslow.treat.sex = basehaz(fit = Cox.treat.sex, centered = FALSE) |> 
+  mutate(surv.placebo.male = exp(- hazard)) 
+
+# Create dataframe of 4 treatment x sex combos 
+combos = expand.grid(treat = c("placebo", "rIFN-g"), 
+                     sex = c("female", "male"))
+
+# Create duplicate rows of "breslow" for each combo 
+breslow_long = Breslow.treat.sex[rep(x = 1:nrow(Breslow.treat.sex), times = 4), ] |> 
+  bind_cols(combos[rep(x = 1:4, each = nrow(Breslow.treat.sex)), ])
+
+# Add predicted risk column 
+breslow_long$risk = predict(Cox.treat.sex, newdata = breslow_long, type = "risk")
+
+# Add conditional survival column 
+breslow_long$surv = breslow_long$surv.placebo.male ^ breslow_long$risk
+
+# Plot them 
+breslow_long |> 
+  ggplot(aes(x = time, y = surv, color = treat, linetype = sex)) +
+  geom_step()
+```
+
+### **Interaction: Treatment and Age**
+
+```{r}
+# Fitting Cox Model ------------------------------------------------------------
+Cox.treat.age = coxph(formula = Surv(time = time, event = status) ~ treat * age_cat,
+                      data = cgd_data)
+```
+
+```{r}
+# Table of the estimated coefficient and other values
+Treat.coef.df <- data.frame(beta = summary(Cox.treat.age)$coefficients[,1],
+                            lb = summary(Cox.treat.age)$coefficients[,1] - 
+                                  1.96 * summary(Cox.treat.age)$coefficients[,3],
+                            ub = summary(Cox.treat.age)$coefficients[,1] + 
+                                  1.96 * summary(Cox.treat.age)$coefficients[,3],
+                            e.beta = summary(Cox.treat.age)$coefficients[,2],
+                            lb = summary(Cox.treat.age)$conf.int[,3],
+                            ub = summary(Cox.treat.age)$conf.int[,4],
+                            se = summary(Cox.treat.age)$coefficients[,3],
+                            p.val = summary(Cox.treat.age)$coefficients[,5]) |> round(3)
+
+
+Treat.coef.df |>
+  kable(align = "cccc", col.names = c("$\\beta$",
+                                      "$\\text{Lower Bound}$",
+                                      "$\\text{Upper Bound}$",
+                                      "$\\exp{(\\beta)}$",
+                                      "$\\text{Lower Bound}$",
+                                      "$\\text{Upper Bound}$",
+                                      "$\\text{SE}(\\beta)$",
+                                      "$\\text{p-value}$")) |>
+  kable_styling() |>
+  add_header_above(c(" " = 2,
+                     "95% Confidence Interval for $\\beta$" = 2,
+                     " " = 1,
+                     "95% Confidence Interval for $\\exp(\\beta)$" = 2,
+                     " " = 2)) |>
+  add_header_above(c("Estimates of log HR, $\\beta$, from the Cox model" = 9),
+                   color = "#007BA7")
+```
+
+```{r}
+# Calculating Survival Estimates -----------------------------------------------
+
+# Breslow's Estimator for baseline survival
+Breslow.treat.age = basehaz(fit = Cox.treat.age, centered = FALSE) |> 
+  mutate(surv1 = exp(- hazard))
+
+# Create dataframe of 6 care x type combos 
+combos = expand.grid(age_cat = c("0-10", "10-20", "20-30"),
+                     treat = c("placebo", "rIFN-g"))
+
+# Create duplicate rows of "breslow" for each combo 
+breslow_long = Breslow.treat.age[rep(x = 1:nrow(Breslow.treat.age), times = 6), ] |> 
+  bind_cols(combos[rep(x = 1:6, each = nrow(Breslow.treat.age)), ])
+
+# Add predicted risk column 
+breslow_long$risk = predict(Cox.treat.age, newdata = breslow_long, type = "risk")
+
+# Add conditional survival column 
+breslow_long$surv = breslow_long$surv1 ^ breslow_long$risk
+
+# Plot them 
+breslow_long |> 
+  ggplot(aes(x = time, y = surv, color = age_cat, linetype = treat)) +
+  geom_step()
+```
+
+### **Interaction: Treatment and BMI**
+
+```{r}
+# Fitting Cox Model
+Cox.treat.bmi = coxph(formula = Surv(time = time, event = status) ~ treat * bmi_cat,
+                      data = cgd_data_BMI)
+```
+
+```{r}
+# Table of the estimated coefficient and other values
+Treat.coef.df <- data.frame(beta = summary(Cox.treat.bmi)$coefficients[,1],
+                            lb = summary(Cox.treat.bmi)$coefficients[,1] - 
+                                  1.96 * summary(Cox.treat.bmi)$coefficients[,3],
+                            ub = summary(Cox.treat.bmi)$coefficients[,1] + 
+                                  1.96 * summary(Cox.treat.bmi)$coefficients[,3],
+                            e.beta = summary(Cox.treat.bmi)$coefficients[,2],
+                            lb = summary(Cox.treat.bmi)$conf.int[,3],
+                            ub = summary(Cox.treat.bmi)$conf.int[,4],
+                            se = summary(Cox.treat.bmi)$coefficients[,3],
+                            p.val = summary(Cox.treat.bmi)$coefficients[,5]) |> round(3)
+
+# Formatted Table
+Treat.coef.df |>
+  kable(align = "cccc", col.names = c("$\\beta$",
+                                      "$\\text{Lower Bound}$",
+                                      "$\\text{Upper Bound}$",
+                                      "$\\exp{(\\beta)}$",
+                                      "$\\text{Lower Bound}$",
+                                      "$\\text{Upper Bound}$",
+                                      "$\\text{SE}(\\beta)$",
+                                      "$\\text{p-value}$")) |>
+  kable_styling() |>
+  add_header_above(c(" " = 2,
+                     "95% Confidence Interval for $\\beta$" = 2,
+                     " " = 1,
+                     "95% Confidence Interval for $\\exp(\\beta)$" = 2,
+                     " " = 2)) |>
+  add_header_above(c("Estimates of log HR, $\\beta$, from the Cox model" = 9),
+                   color = "#007BA7")
+```
+
+```{r}
+# Calculating Survival Estimates -----------------------------------------------
+
+# Breslow's Estimator for baseline survival
+Breslow.treat.bmi = basehaz(fit = Cox.treat.bmi, centered = FALSE) |> 
+  mutate(surv1 = exp(- hazard))
+
+# Create dataframe of 6 care x type combos 
+combos = expand.grid(treat = c("placebo", "rIFN-g"), 
+                     bmi_cat = c("normal", "overweight", "underweight"))
+
+# Create duplicate rows of "breslow" for each combo 
+breslow_long = Breslow.treat.bmi[rep(x = 1:nrow(Breslow.treat.bmi), times = 6), ] |> 
+  bind_cols(combos[rep(x = 1:6, each = nrow(Breslow.treat.bmi)), ])
+
+# Add predicted risk column 
+breslow_long$risk = predict(Cox.treat.bmi, newdata = breslow_long, type = "risk")
+
+# Add conditional survival column 
+breslow_long$surv = breslow_long$surv1 ^ breslow_long$risk
+
+# Plot them 
+breslow_long |> 
+  ggplot(aes(x = time, y = surv, color = bmi_cat, linetype = treat)) +
+  geom_step()
+```
+
+
+## **Continuous Covariates**
+
+We will now calculate the Hazard Ratios and survival estimates. This will be done the same way as for our discrete covariates because we discretized the data into BMI categories.
+
+### **BMI**
+
+```{r}
+# Fitting Cox Model ------------------------------------------------------------
+Cox.BMI = coxph(formula = Surv(time = time, event = status) ~ bmi_cat,
+                  data = cgd_data_BMI)
+```
+
+```{r}
+# Table of the estimated coefficient and other values
+BMI.coef.df <- data.frame(beta = summary(Cox.BMI)$coefficients[,1],
+                            lb = summary(Cox.BMI)$coefficients[,1] - 
+                                  1.96 * summary(Cox.BMI)$coefficients[,3],
+                            ub = summary(Cox.BMI)$coefficients[,1] + 
+                                  1.96 * summary(Cox.BMI)$coefficients[,3],
+                            e.beta = summary(Cox.BMI)$coefficients[,2],
+                            lb = summary(Cox.BMI)$conf.int[,3],
+                            ub = summary(Cox.BMI)$conf.int[,4],
+                            se = summary(Cox.BMI)$coefficients[,3],
+                            p.val = summary(Cox.BMI)$coefficients[,5]) |> round(3)
+
+# Formatted Table
+BMI.coef.df |>
+  kable(align = "cccc", col.names = c("$\\beta$",
+                                      "$\\text{Lower Bound}$",
+                                      "$\\text{Upper Bound}$",
+                                      "$\\exp{(\\beta)}$",
+                                      "$\\text{Lower Bound}$",
+                                      "$\\text{Upper Bound}$",
+                                      "$\\text{SE}(\\beta)$",
+                                      "$\\text{p-value}$")) |>
+  kable_styling() |>
+  add_header_above(c(" " = 2,
+                     "95% Confidence Interval for $\\beta$" = 2,
+                     " " = 1,
+                     "95% Confidence Interval for $\\exp(\\beta)$" = 2,
+                     " " = 2)) |>
+  add_header_above(c("Estimates of log HR, $\\beta$, from the Cox model" = 9),
+                   color = "#007BA7")
+```
+
+```{r}
+# Calculating Survival Estimates for the Survival curve ------------------------
+
+# Breslow's Estimator for Survival
+Breslow.BMI = basehaz(fit = Cox.BMI, centered = FALSE) |> 
+  mutate(surv1 = exp(- hazard)) |>
+  mutate(surv2 = surv1 ^ exp(Cox.BMI$coefficients[1]) ) |>
+  mutate(surv3 = surv1 ^ exp(Cox.BMI$coefficients[2]))
+
+# Plot Survival
+Breslow.BMI |> 
+  gather(key = "BMI", value = "Survival", -c(1:2)) |>
+  mutate(BMI = factor(x = BMI,
+                        levels = paste0("surv", 1:3),
+                        labels = c("Normal", "Overweight", "Underweight"))) |>
+  ggplot(aes(x = time, y = Survival, color = BMI)) +
+  geom_step() +
+  theme_minimal()
+```
+
+```{r}
+# Survival Estimates for 50, 100, 200, 300 days --------------------------------
+
+# Creating a new data fram for the survfit function
+newdf <- data.frame(bmi_cat = c("normal", "overweight", "underweight"))
+
+# Passing coxph object to survfit
+surv.BMI <- survfit(Cox.BMI,
+                      newdata = newdf,
+                      conf.type = "log-log")
+
+# Pulling the survival times and confidence intervals
+summary.bres.BMI <- data.frame(Time = summary(surv.BMI)$time,
+                               Surv.nrml = summary(surv.BMI)$surv[,1],
+                               lb.nrml = summary(surv.BMI)$lower[,1],
+                               ub.nrml = summary(surv.BMI)$upper[,1],
+                               Surv.ovr = summary(surv.BMI)$surv[,2],
+                               lb.ovr = summary(surv.BMI)$lower[,2],
+                               ub.ovr = summary(surv.BMI)$upper[,2],
+                               Surv.undr = summary(surv.BMI)$surv[,3],
+                               lb.undr = summary(surv.BMI)$lower[,3],
+                               ub.undr = summary(surv.BMI)$upper[,3]) |> round(3)
+
+# Filtering by the times we're interested in
+summary.bres.BMI <- summary.bres.BMI |>
+  filter(Time %in% c(23,99,187,294))
+
+# Removing the row times and adding the row name for 50,100,200,300 days
+summary.bres.BMI <- summary.bres.BMI[,-1]
+rownames(summary.bres.BMI) <- c("50 days",
+                                  "100 days",
+                                  "200 days",
+                                  "300 days")
+
+
+# Ordering data
+summary.bres.BMI <- summary.bres.BMI[,c(7,8,9,1,2,3,4,5,6)]
+
+# Formatted Table
+summary.bres.BMI |>
+kable(align = "cccc", col.names = c("$\\hat{S}(x)$",
+                                  "Lower Bound",
+                                  "Upper Bound",
+                                  "$\\hat{S}(x)$",
+                                  "Lower Bound",
+                                  "Upper Bound",
+                                  "$\\hat{S}(x)$",
+                                  "Lower Bound",
+                                  "Upper Bound")) |>
+  kable_styling() |>
+  add_header_above(c(" " = 2,
+                     "95% Confidence Interval for $\\hat{S}(x)$" = 2,
+                     " " = 1,
+                     "95% Confidence Interval for $\\hat{S}(x)$" = 2,
+                     " " = 1,
+                     "95% Confidence Interval for $\\hat{S}(x)$" = 2)) |>
+  add_header_above(c(" " = 1,
+                     "Underweight" = 3,
+                     "Normal Weight" = 3,
+                     "Overweight" = 3)) |>
+  add_header_above(c("Estimates of $\\hat{S}(x)$, from the Cox model with covariate $\\texttt{treatment}$" = 10),
+                   color = "#007BA7")
+
+```
