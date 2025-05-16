@@ -1,6 +1,7 @@
 ---
-title: "Final Project"
+title: "Time to Serious Infection for Patients with CGD"
 author: "Noah Couch"
+date: "December 2024"
 output: 
   html_document:
     theme: cerulean
